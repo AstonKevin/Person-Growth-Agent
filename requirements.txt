@@ -1,0 +1,11 @@
+fastapi==0.138.0
+uvicorn==0.40.0
+SQLAlchemy==2.0.48
+PyMySQL==1.1.1
+alembic==1.19.1
+pydantic==2.12.3
+pydantic-settings==2.10.1
+anthropic==1.2.0
+httpx==0.28.1
+python-jose[cryptography]
+python-multipart
