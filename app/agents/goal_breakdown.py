@@ -4,12 +4,12 @@ import operator
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langchain_ollama import ChatOllama
 from pydantic import BaseModel,Field,ValidationError
 from datetime import datetime, timedelta
 from ..database import SessionLocal
 from ..crud.plan import create_plan
 from ..schemas.plan import PlanCreate
+from .common import make_llm, parse_json
 
 
 WEEKLY_PROMPT = """你是一个专业的目标拆解专家。请根据用户的目标，生成一个按周拆解的详细计划。
@@ -127,11 +127,7 @@ def extract_structured_goal(raw_goal: str, text: str) -> StructuredGoal:
     return StructuredGoal(**data)
 
 
-llm = ChatOllama(
-    base_url="http://localhost:11434",
-    model="qwen3:8b",
-    temperature=0.3,
-)
+llm = make_llm(temperature=0.3)
 
 class GoalState(TypedDict):
     goal: str
@@ -167,22 +163,6 @@ def parse_goal(state: GoalState):
     return {"struct_goal": None}
 
 
-def parse_json(text):
-    text = text.strip()
-    if "```" in text:
-        for part in text.split("```"):
-            p = part.strip()
-            if p.lower().startswith("json"):
-                p = p[4:].strip()
-            if p.startswith("[") or p.startswith("{"):
-                try:
-                    return json.loads(p)
-                except Exception:
-                    pass
-    try:
-        return json.loads(text)
-    except Exception:
-        return None
 
 def gate_after_parse(state: GoalState) -> str:
     """parse_goal 之后的闸门：判断要不要继续拆解。"""

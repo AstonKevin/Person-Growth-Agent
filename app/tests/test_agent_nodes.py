@@ -4,6 +4,14 @@ from app.agents.goal_breakdown import (
     extract_weekly_plans, extract_daily_plans,
     gate_after_parse, reject_goal, WeekPlanItem, DailyPlanItem,
 )
+from app.agents.tracking_agent import apply_changes
+import copy
+
+# apply_changes 用的固定计划
+DAILY = [
+    {"day": 1, "week": 1, "task": "学习卷腹", "priority": "高", "notes": ""},
+    {"day": 4, "week": 1, "task": "测量体脂率基线", "priority": "中", "notes": ""},
+]
 
 # ========== extract_weekly_plans ==========
 def test_extract_weekly_ok():
@@ -59,3 +67,38 @@ def test_reject_returns_no_save_and_clarification():
 def test_reject_has_default_clarification_when_none():
     out = reject_goal({"goal": "x", "struct_goal": None})
     assert out["final_plan"]["warning"]  # 有默认提示，不为空
+
+
+# ========== apply_changes（动态调整纯函数）==========
+def test_apply_postpone_moves_task():
+    changes = [{"task": "测量体脂率基线", "action": "postpone", "to_day": 6, "new_content": None}]
+    out = apply_changes(DAILY, changes)
+    moved = [d for d in out if d["task"] == "测量体脂率基线"][0]
+    assert moved["day"] == 6
+    assert moved["week"] == 1
+
+def test_apply_reduce_changes_content():
+    changes = [{"task": "学习卷腹", "action": "reduce", "to_day": None, "new_content": "10分钟卷腹"}]
+    out = apply_changes(DAILY, changes)
+    reduced = [d for d in out if d["day"] == 1][0]
+    assert reduced["task"] == "10分钟卷腹"
+
+def test_apply_changes_no_match_skip():
+    """找不到匹配任务，计划不变"""
+    changes = [{"task": "不存在的任务", "action": "postpone", "to_day": 9, "new_content": None}]
+    out = apply_changes(DAILY, changes)
+    assert out == DAILY
+
+def test_apply_changes_fuzzy_match():
+    """只给部分任务名，靠包含匹配命中"""
+    changes = [{"task": "体脂率", "action": "postpone", "to_day": 7, "new_content": None}]
+    out = apply_changes(DAILY, changes)
+    moved = [d for d in out if "测量体脂率基线" in d["task"]][0]
+    assert moved["day"] == 7
+
+def test_apply_changes_does_not_mutate_input():
+    """纯函数：原输入不被修改"""
+    original = copy.deepcopy(DAILY)
+    changes = [{"task": "测量体脂率基线", "action": "postpone", "to_day": 6, "new_content": None}]
+    apply_changes(DAILY, changes)
+    assert DAILY == original

@@ -1,6 +1,15 @@
 # Personal-Growth-Agent
 
 个人成长助手后端 API。基于 FastAPI + MySQL + SQLAlchemy，支持用户注册登录、成长计划管理、打卡记录与统计、AI 目标拆解。
+> 基于 LangGraph 的个人成长目标拆解与执行跟踪 Agent：输入自然语言目标，自动判断有效性、拆解为周/日计划、校验后存入 MySQL，配套 Streamlit 交互前端与 FastAPI 后端。
+
+## ✨ 项目亮点
+
+- **双 Agent 闭环**：目标拆解（规划）与执行跟踪（打卡/反馈）两个独立 LangGraph，通过 plan 表解耦
+- **动态调整**：LLM 输出结构化操作（延期/减量），interrupt 暂停等人确认后幂等写回计划
+- **双层输入校验**：前端规则拦截 + 后端 LLM 语义判断（is_real_goal），空泛目标不落库
+- **结构化输出**：Pydantic 校验周/日计划与调整操作，坏数据容错跳过
+- **工程化**：FastAPI 分层 + JWT + Alembic，pytest 套件（20 单元 + 7 集成）
 
 ## 技术栈
 
@@ -23,13 +32,16 @@
 ```
 Person_Growth_Agent/
 ├── app/
-│   ├── agents/                  # LangGraph 目标拆解 Agent
-│   │   ├── goal_breakdown.py    # 图定义：parse_goal→闸门→周/日计划→校验循环→存库
-│   │   └── app.py               # Streamlit 前端
-│   └── tests/                   # pytest 测试（纯函数 + 集成）
+│   ├── agents/                  # LangGraph 双 Agent
+│   │   ├── common.py            # 公共：LLM 工厂 + JSON 解析
+│   │   ├── goal_breakdown.py    # 目标拆解图：parse→闸门→周/日→校验→存库
+│   │   ├── tracking_agent.py    # 执行跟踪图：打卡→进度→反馈→动态调整
+│   │   └── app.py               # Streamlit 主入口（tabs 整合）
+│   └── tests/                   # pytest 测试（单元 + 集成）
 │       ├── test_goal_parser.py
 │       ├── test_agent_nodes.py
-│       └── test_e2e.py
+│       ├── test_e2e.py
+│       └── test_integration_flow.py
 │   ├── main.py                  # 应用入口，挂载路由 + 全局异常
 │   ├── database.py              # 数据库连接 / Session
 │   ├── deps.py                  # 公共依赖（get_current_user 鉴权）
@@ -198,6 +210,54 @@ uvicorn app.main:app --reload
 - **完成率**：打卡天数 / 计划总天数 × 100%
 - **级联删除**：删除计划时自动删除其下所有打卡记录
 - **异常统一**：自定义异常基类 + 全局 handler，错误格式一致
+
+## Agent 架构（模块说明）
+
+系统由两个独立 LangGraph Agent 组成，通过 MySQL `plan` 表解耦：
+
+| Agent | 文件 | 阶段 | 频率 | checkpointer |
+| ----- | ---- | ---- | ---- | ------------ |
+| 目标拆解 | `goal_breakdown.py` | 规划：目标 → 周/日计划 | 一次性 | 无 |
+| 执行跟踪 | `tracking_agent.py` | 执行：打卡 → 反馈/调整 | 每日反复 | InMemorySaver |
+
+```mermaid
+flowchart TD
+    G[自然语言目标] --> A[目标拆解 Agent]
+    A --> P[(plan 表)]
+    P --> B[执行跟踪 Agent]
+    B -->|严重落后| C[生成结构化操作]
+    C --> D[interrupt 等人确认]
+    D -->|确认| E[写回 plan]
+    B -->|正常/轻微落后| F[保存打卡]
+    E --> F
+```
+
+### 目标拆解 Agent
+
+`parse_goal` → 闸门 → `plan_weekly` → `plan_daily` → `validate`（不通过则带反馈循环）→ `output` → `save_plan`
+无效目标走 `reject_goal`，不拆解、不落库。
+
+### 执行跟踪 Agent
+
+`load_today_tasks` → `receive_checkin` → `load_history` → `calculate_progress` → `generate_feedback`
+- 正常 / 轻微落后：直接 `save_checkin`
+- 严重落后：`maybe_adjust_plan` → `confirm_adjustment`（interrupt）→ `apply_adjustment` → `save_checkin`
+
+### 动态调整机制
+
+- LLM 输出结构化操作，而非自由文本：
+  - `postpone`（延期，需提供 `to_day`）
+  - `reduce`（减量，需提供 `new_content`）
+- `apply_changes` 是**纯函数**（计划 + 操作 → 新计划），`apply_adjustment` 节点负责幂等写回
+- 用户取消则不改动计划，仅保存打卡
+
+### 关键设计原则
+
+- **服务边界**：规划与执行分离，靠 plan_id 关联，避免单图职责臃肿
+- **算 / 写分离**：解析、计算、调整均为纯函数，数据库副作用收敛到节点，便于测试
+- **人机协同**：checkpoint 存档 + interrupt 暂停，确认后恢复
+- **公共复用**：`common.py` 统一 LLM 工厂与 JSON 解析
+
 ### 5. 启动目标拆解 Agent 前端
 
 确保本地 Ollama 已拉取模型：
