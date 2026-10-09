@@ -10,7 +10,7 @@ def make_llm(temperature: float = 0.3):
     """统一创建本地 Ollama 模型"""
     return ChatOllama(
         base_url="http://localhost:11434",
-        model="qwen3:8b",
+        model="gemma3:4b",
         temperature=temperature,
     )
 

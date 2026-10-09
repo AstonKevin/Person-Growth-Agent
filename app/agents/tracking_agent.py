@@ -14,6 +14,7 @@ from app.database import SessionLocal
 from app.models.plan import Plan
 from app.models.checkin import CheckIn
 from .common import make_llm, parse_json
+from .weather import is_outdoor_task, get_weather, is_weather_unfriendly, CITY_COORDS
 import copy
 
 
@@ -44,6 +45,11 @@ class TrackingState(TypedDict):
     adjustment_changes: list[dict]
     # 节点 7
     saved: bool
+    # 天气（预防性调整）
+    city: Optional[str]
+    weather: Optional[dict]
+    weather_warning: bool
+
 
 # LLM配置
 llm = make_llm(temperature=0.2)
@@ -73,6 +79,31 @@ def load_today_tasks(state: TrackingState):
     finally:
         db.close()
 
+def fetch_weather(state: TrackingState):
+    print("\n=== [节点] fetch_weather 查天气 ===")
+    today_tasks = state.get("daily_tasks", [])
+    outdoor = [t for t in today_tasks if is_outdoor_task(t.get("task", ""))]
+    if not outdoor:
+        print("今天没有户外任务，跳过天气")
+        return {"weather": None, "weather_warning": False}
+
+    city = state.get("city") or "南京"
+    if city not in CITY_COORDS:
+        print("未知城市，跳过")
+        return {"weather": None, "weather_warning": False}
+
+    lat, lon = CITY_COORDS[city]
+    try:
+        w = get_weather(lat, lon, state["today"])
+    except Exception as e:
+        print("天气查询失败：", e)
+        return {"weather": None, "weather_warning": False}
+
+    warning = is_weather_unfriendly(w)
+    print(f"{city} 天气：{w}，不宜户外? {warning}")
+    return {"weather": w, "weather_warning": warning}
+
+
 def load_history(state: TrackingState):
     print("\n=== [节点] load_history 读历史打卡 ===")
     db = SessionLocal()
@@ -99,9 +130,10 @@ class CheckinItem(BaseModel):
 
 class PlanChange(BaseModel):
     task: str
-    action: Literal["postpone", "reduce"]
+    action: Literal["postpone", "reduce", "lower_intensity", "switch_type"]
     to_day: Optional[int] = None
     new_content: Optional[str] = None
+    new_type: Optional[str] = None
 
     @model_validator(mode="after")
     def check_required(self):
@@ -111,6 +143,13 @@ class PlanChange(BaseModel):
         # 减量必须给新内容
         if self.action == "reduce" and not self.new_content:
             raise ValueError("reduce 操作必须给出 new_content")
+        # 降强度必须给新内容
+        if self.action == "lower_intensity" and not self.new_content:
+            raise ValueError("lower_intensity 操作必须给出 new_content")
+        # 换类型必须给新类型和新内容
+        if self.action == "switch_type":
+            if not self.new_type or not self.new_content:
+                raise ValueError("switch_type 操作必须给出 new_type 和 new_content")
         return self
 
 CHECKIN_PROMPT = """你是一个打卡理解助手。
@@ -277,21 +316,87 @@ ADJUSTMENT_PROMPT = """你是一个目标调整顾问。用户的计划执行严
 - 打卡明细：
 {items}
 
-请给出调整建议，并用操作指令说明如何改任务。每个操作必须包含足够信息：
-- 延期（postpone）：说明任务名和挪到第几天（to_day）
-- 减量（reduce）：说明任务名和新的任务内容（new_content）
+请给出调整建议，并用操作指令说明如何改任务。可选择的操作：
+- 延期（postpone）：任务挪到以后，需给出 to_day
+- 减量（reduce）：任务量减少，需给出 new_content
+- 降强度（lower_intensity）：难度降低（如快跑改慢跑），需给出 new_content
+- 换类型（switch_type）：换成别的类型（如户外改室内），需给出 new_type 和 new_content
 
 只输出一个 JSON，格式如下：
 {{
   "suggestion": "2-3句话的调整建议",
   "changes": [
     {{"task": "任务原文", "action": "postpone", "to_day": 6}},
-    {{"task": "任务原文", "action": "reduce", "new_content": "简化后的任务"}}
+    {{"task": "任务原文", "action": "lower_intensity", "new_content": "降低难度后的任务"}}
   ]
 }}
 
-只输出 JSON，不要输出其他文字。延期天数要合理，减量后的任务要现实可执行。"""
+只输出 JSON，不要输出其他文字。调整要现实可执行，根据落后程度选择最合适的策略。"""
 
+WEATHER_ADJUST_PROMPT = """你是一个运动计划顾问。今天天气不适合户外运动，需要把户外任务调整为可执行的方案。
+
+今天的天气：
+- 最高温 {temp_max}℃，最低温 {temp_min}℃
+- 降水概率 {precip_prob}%
+
+今天的户外任务：
+{outdoor_tasks}
+
+请给出调整方案，用操作指令说明：
+- 换类型（switch_type）：把户外任务换成室内运动，需给出 new_type（如"室内"）和 new_content
+- 降强度（lower_intensity）：若无法完全室内替代，就降低强度，需给出 new_content
+
+只输出 JSON：
+{{
+  "suggestion": "1-2句话，说明天气情况和建议",
+  "changes": [
+    {{"task": "户外任务原文", "action": "switch_type", "new_type": "室内", "new_content": "室内替代任务"}}
+  ]
+}}
+
+只输出 JSON，替代运动要现实可行。"""
+
+def weather_adjust_plan(state: TrackingState):
+    print("\n=== [节点] weather_adjust_plan 生成天气调整 ===")
+    w = state.get("weather") or {}
+    outdoor_tasks = [t for t in state.get("daily_tasks", []) if is_outdoor_task(t.get("task", ""))]
+    tasks_text = "\n".join(f"- {t['task']}" for t in outdoor_tasks)
+
+    resp = llm.invoke([HumanMessage(content=WEATHER_ADJUST_PROMPT.format(
+        temp_max=w.get("temp_max"),
+        temp_min=w.get("temp_min"),
+        precip_prob=w.get("precip_prob"),
+        outdoor_tasks=tasks_text,
+    ))])
+    data = parse_json(resp.content)
+    if not isinstance(data, dict):
+        data = {}
+
+    suggestion = data.get("suggestion", "今天天气不宜户外，建议改为室内运动")
+    changes = []
+    for c in data.get("changes", []):
+        if isinstance(c, dict):
+            try:
+                changes.append(PlanChange(**c).model_dump())
+            except ValidationError:
+                continue
+    print(f"天气建议：{suggestion}")
+    print(f"有效操作 {len(changes)} 条")
+    return {"adjustment_suggestion": suggestion, "adjustment_changes": changes}
+
+
+def confirm_weather_adjust(state: TrackingState):
+    print("\n=== [节点] confirm_weather_adjust 暂停等确认 ===")
+    w = state.get("weather") or {}
+    payload = {
+        "question": "今天天气不宜户外，是否调整计划？",
+        "suggestion": state.get("adjustment_suggestion", ""),
+        "weather": f"降水概率 {w.get('precip_prob')}%，{w.get('temp_min')}~{w.get('temp_max')}℃",
+    }
+    answer = interrupt(payload)
+    confirmed = answer in (True, "yes", "是", "确认")
+    print(f"用户确认：{confirmed}")
+    return {"user_confirmed": confirmed}
 
 
 def maybe_adjust_plan(state: TrackingState):
@@ -336,6 +441,36 @@ def maybe_adjust_plan(state: TrackingState):
         "adjustment_changes": changes,
     }
 
+def apply_weather_adjust(state: TrackingState):
+    print("\n=== [节点] apply_weather_adjust 应用天气调整 ===")
+    if not state.get("user_confirmed"):
+        print("用户选择保持户外原计划")
+        return {}
+
+    base_plan = state.get("full_daily_plan", [])
+    changes = state.get("adjustment_changes", [])
+    new_plan = apply_changes(base_plan, changes)
+
+    today = date.fromisoformat(state["today"])
+    new_tasks = []
+    db = SessionLocal()
+    try:
+        p = db.query(Plan).filter(Plan.id == state["plan_id"]).first()
+        if p and new_plan:
+            p.daily_plan = json.dumps(new_plan, ensure_ascii=False)
+            db.commit()
+            print(f"已按天气更新计划 {p.id}")
+            day_index = (today - p.start_time.date()).days + 1
+            today_items = [d for d in new_plan if d.get("day") == day_index]
+            new_tasks = [{"task": d.get("task"), "notes": d.get("notes", "")} for d in today_items]
+        else:
+            print("未更新")
+    finally:
+        db.close()
+
+    if new_tasks:
+        return {"full_daily_plan": new_plan, "daily_tasks": new_tasks}
+    return {}
 
 
 def confirm_adjustment(state: TrackingState):
@@ -356,11 +491,12 @@ def apply_changes(daily_plan: list[dict], changes: list[dict]) -> list[dict]:
     """
     纯函数：根据操作指令生成调整后的新 daily_plan
     - postpone：把任务挪到指定天数
-    - reduce：把任务内容改成新内容
+    - reduce / lower_intensity：把任务改成新内容
+    - switch_type：改任务内容并记录新类型 category
     不修改原数据；找不到匹配任务的操作跳过。
     """
     new_plan = copy.deepcopy(daily_plan)
-    used = set()   # 已匹配的项索引，避免重复改
+    used = set()
 
     for ch in changes:
         target_task = ch.get("task", "")
@@ -370,15 +506,23 @@ def apply_changes(daily_plan: list[dict], changes: list[dict]) -> list[dict]:
         used.add(idx)
 
         item = new_plan[idx]
-        if ch.get("action") == "postpone":
+        action = ch.get("action")
+
+        if action == "postpone":
             to_day = ch.get("to_day")
             if to_day is not None:
                 item["day"] = to_day
                 item["week"] = (to_day - 1) // 7 + 1
-        elif ch.get("action") == "reduce":
+        elif action in ("reduce", "lower_intensity"):
             new_content = ch.get("new_content")
             if new_content:
                 item["task"] = new_content
+        elif action == "switch_type":
+            new_content = ch.get("new_content")
+            if new_content:
+                item["task"] = new_content
+            if ch.get("new_type"):
+                item["category"] = ch["new_type"]   # 记录换后的类型
 
     return new_plan
 
@@ -426,6 +570,12 @@ def apply_adjustment(state: TrackingState):
 
     return {"feedback": state["feedback"] + note}
 
+def route_after_weather(state: TrackingState) -> str:
+    """fetch_weather 后：天气差 → 预防调整，否则直接打卡"""
+    if state.get("weather_warning"):
+        return "weather_adjust"
+    return "checkin"
+
 
 def save_checkin(state: TrackingState):
     print("\n=== [节点] save_checkin 写打卡记录 ===")
@@ -461,16 +611,35 @@ builder.add_node("apply_adjustment", apply_adjustment)
 builder.add_node("save_checkin", save_checkin)
 builder.add_node("load_today_tasks", load_today_tasks)
 builder.add_node("load_history", load_history)
+builder.add_node("fetch_weather", fetch_weather)
+builder.add_node("weather_adjust_plan", weather_adjust_plan)
+builder.add_node("confirm_weather_adjust", confirm_weather_adjust)
+builder.add_node("apply_weather_adjust", apply_weather_adjust)
 
 
-# 固定边（前 3 个节点串行）
-builder.add_edge(START, "load_today_tasks")               
-builder.add_edge("load_today_tasks", "receive_checkin")    
+# 入口：读今日任务 → 查天气
+builder.add_edge(START, "load_today_tasks")
+builder.add_edge("load_today_tasks", "fetch_weather")
+
+# 天气分流：差则预防性调整，否则直接打卡
+builder.add_conditional_edges(
+    "fetch_weather",
+    route_after_weather,
+    {
+        "weather_adjust": "weather_adjust_plan",
+        "checkin": "receive_checkin",
+    }
+)
+builder.add_edge("weather_adjust_plan", "confirm_weather_adjust")
+builder.add_edge("confirm_weather_adjust", "apply_weather_adjust")
+builder.add_edge("apply_weather_adjust", "receive_checkin")
+
+# 打卡 → 历史 → 计算 → 反馈
 builder.add_edge("receive_checkin", "load_history")
 builder.add_edge("load_history", "calculate_progress")
 builder.add_edge("calculate_progress", "generate_feedback")
 
-# 条件边：feedback 后分流
+# 反馈后分流
 builder.add_conditional_edges(
     "generate_feedback",
     route_after_feedback,
@@ -480,7 +649,7 @@ builder.add_conditional_edges(
     }
 )
 
-# 调整分支
+# 进度调整分支
 builder.add_edge("maybe_adjust_plan", "confirm_adjustment")
 builder.add_edge("confirm_adjustment", "apply_adjustment")
 builder.add_edge("apply_adjustment", "save_checkin")
@@ -488,6 +657,7 @@ builder.add_edge("save_checkin", END)
 
 # 编译：必须挂 checkpointer，因为 interrupt 需要它
 graph = builder.compile(checkpointer=InMemorySaver())
+
 
 
 def run_agent(plan_id, today, raw_checkin, resume_value=None):

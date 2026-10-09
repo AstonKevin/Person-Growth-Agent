@@ -101,3 +101,51 @@ def test_plan_then_adjust_with_confirmation():
         assert "计划" in r2["feedback"]
     finally:
         _cleanup(pid)
+
+def test_outdoor_bad_weather_switches_to_indoor(monkeypatch):
+    """户外计划 + mock 差天气 → 打卡前暂停 → 确认 → day1 改成室内并落库"""
+    from app.agents import tracking_agent as ta
+    pid = _make_plan("1个月养成晨跑习惯")
+    today = date.today().isoformat()
+    config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+
+    # 把 day1 任务改成户外任务，保证命中天气（拆解产物里 day1 可能是准备工作）
+    db = SessionLocal()
+    try:
+        p = db.query(Plan).filter(Plan.id == pid).first()
+        daily = json.loads(p.daily_plan)
+        for d in daily:
+            if d.get("day") == 1:
+                d["task"] = "户外晨跑30分钟"
+                d.pop("category", None)
+        p.daily_plan = json.dumps(daily, ensure_ascii=False)
+        db.commit()
+    finally:
+        db.close()
+
+    # mock 差天气：降水概率 90%
+    def fake_weather(lat, lon, d):
+        return {"date": d, "temp_max": 18, "temp_min": 12, "precip_prob": 90}
+    monkeypatch.setattr(ta, "get_weather", fake_weather)
+
+    try:
+        r1 = tracking_graph.invoke(
+            {"plan_id": pid, "today": today, "raw_checkin": "",
+             "checkin_items": [{"task": "户外晨跑30分钟", "completed": True, "note": "完成"}]},
+            config,
+        )
+        assert r1.get("__interrupt__"), "差天气应在打卡前暂停"
+
+        r2 = tracking_graph.invoke(Command(resume=True), config)
+        assert r2["saved"] is True
+
+        # day1 已改成室内
+        db = SessionLocal()
+        try:
+            p = db.query(Plan).filter(Plan.id == pid).first()
+            day1 = [d for d in json.loads(p.daily_plan) if d.get("day") == 1][0]
+            assert day1["category"] == "室内"
+        finally:
+            db.close()
+    finally:
+        _cleanup(pid)

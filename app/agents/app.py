@@ -20,6 +20,7 @@ from app.models.plan import Plan
 from app.models.checkin import CheckIn
 from app.agents.goal_breakdown import graph as goal_graph
 from app.agents.tracking_agent import graph as tracking_graph
+from app.agents.weather import CITY_COORDS, get_weather, is_outdoor_task, is_weather_unfriendly
 from langgraph.types import Command
 
 # ============ 2. 页面基础配置与全局状态 ============
@@ -290,9 +291,17 @@ def render_checkin_tab():
     # 7.1 中断恢复区 (LangGraph Human-in-the-loop)
     if st.session_state.pending:
         payload = st.session_state.pending["payload"]
-        st.warning("⚠️ 进度严重落后，系统建议调整计划，请确认：")
-        st.write("**调整建议：**", payload.get("suggestion", "暂无建议"))
-        st.write("**当前完成率：**", payload.get("current_rate", "未获取"))
+        is_weather = "weather" in payload
+
+        if is_weather:
+            st.warning("🌦️ 今天天气不宜户外，建议调整为室内运动：")
+            st.write("**天气情况：**", payload.get("weather", ""))
+            st.write("**调整建议：**", payload.get("suggestion", ""))
+        else:
+            st.warning("⚠️ 进度严重落后，系统建议调整计划，请确认：")
+            st.write("**调整建议：**", payload.get("suggestion", ""))
+            st.write("**当前完成率：**", payload.get("current_rate", ""))
+
         c1, c2 = st.columns(2)
         if c1.button("✅ 确认调整", use_container_width=True):
             cfg = st.session_state.pending["config"]
@@ -317,6 +326,7 @@ def render_checkin_tab():
             st.rerun()
         return
 
+
     # 7.2 加载计划列表
     plans = load_all_plans()
     if not plans:
@@ -331,6 +341,7 @@ def render_checkin_tab():
         key="checkin_plan_select",
     )
     checkin_date = st.date_input("打卡日期", value=date.today())
+    city = st.selectbox("所在城市（户外天气判断）", options=list(CITY_COORDS.keys()), key="city_select")
 
     # 7.3 获取当日任务
     tasks, day_index = load_today_tasks_for_ui(selected_id, checkin_date.isoformat())
@@ -342,6 +353,20 @@ def render_checkin_tab():
         st.warning(f"第 {day_index} 天没有任务（可能尚未开始、已结束或为休息日）。")
     else:
         st.caption(f"今天是第 {day_index} 天，共 {len(tasks)} 项任务")
+        # 有户外任务时，主动展示天气卡片
+        outdoor = [t for t in tasks if is_outdoor_task(t["task"])]
+        if outdoor:
+            try:
+                w = get_weather(*CITY_COORDS[city], checkin_date.isoformat())
+                c1, c2, c3 = st.columns(3)
+                c1.metric("最高温", f"{w['temp_max']}℃")
+                c2.metric("最低温", f"{w['temp_min']}℃")
+                c3.metric("降水概率", f"{w['precip_prob']}%")
+                if is_weather_unfriendly(w):
+                    st.warning("🌦️ 今天天气不宜户外，提交后可改为室内运动")
+            except Exception:
+                st.caption("天气获取失败")
+
         with st.form("checkin_form"):
             mode = st.radio("打卡方式", ["勾选任务", "文字描述"], horizontal=True)
             checks = {}
@@ -377,6 +402,7 @@ def render_checkin_tab():
                     "today": checkin_date.isoformat(),
                     "raw_checkin": "",
                     "checkin_items": items,
+                    "city": city,
                 }
             else:
                 if not text.strip():
@@ -386,6 +412,7 @@ def render_checkin_tab():
                     "plan_id": selected_id,
                     "today": checkin_date.isoformat(),
                     "raw_checkin": text.strip(),
+                    "city": city,
                 }
 
             with st.spinner("正在处理打卡..."):

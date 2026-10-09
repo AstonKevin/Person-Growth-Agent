@@ -25,7 +25,7 @@
 | 校验       | Pydantic 2                                  |
 | Agent 编排 | LangGraph（StateGraph + 条件边 + 循环校验） |
 | 前端       | Streamlit（表单 + session_state）           |
-| 本地大模型 | Ollama（qwen3:8b）                          |
+| 本地大模型 | Ollama（gemma3:4b）                          |
 
 ## 目录结构
 
@@ -263,6 +263,6 @@ flowchart TD
 确保本地 Ollama 已拉取模型：
 
 ```bash
-ollama pull qwen3:8b
+ollama pull gemma3:4b
 ollama serve
 ```

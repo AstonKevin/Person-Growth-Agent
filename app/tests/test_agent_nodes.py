@@ -102,3 +102,19 @@ def test_apply_changes_does_not_mutate_input():
     changes = [{"task": "测量体脂率基线", "action": "postpone", "to_day": 6, "new_content": None}]
     apply_changes(DAILY, changes)
     assert DAILY == original
+
+def test_apply_lower_intensity_changes_content():
+    """降强度：任务内容改变"""
+    changes = [{"task": "学习卷腹", "action": "lower_intensity", "new_content": "轻松卷腹5分钟"}]
+    out = apply_changes(DAILY, changes)
+    item = [d for d in out if d["day"] == 1][0]
+    assert item["task"] == "轻松卷腹5分钟"
+
+def test_apply_switch_type_changes_content_and_category():
+    """换类型：任务内容改变，且记录新类型 category"""
+    changes = [{"task": "学习卷腹", "action": "switch_type", "new_type": "室内", "new_content": "平板支撑"}]
+    out = apply_changes(DAILY, changes)
+    item = [d for d in out if d["day"] == 1][0]
+    assert item["task"] == "平板支撑"
+    assert item["category"] == "室内"
+
