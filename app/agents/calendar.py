@@ -65,14 +65,15 @@ def build_ics(events: list[dict]) -> str:
     return "\r\n".join(lines)
 
 
-def build_plan_schedule(plan) -> tuple[list[dict], str]:
+def build_plan_schedule(daily_plan: list[dict], start_time) -> tuple[list[dict], str]:
     """给一个 plan 排完整日程：任务按 day 算实际日期、按类型推荐时段。
+    daily_plan: 已解析的每日任务列表
+    start_time: 计划开始时间（datetime）
     返回 (events, ics_text)。
     """
-    daily = json.loads(plan.daily_plan)
-    start = plan.start_time.date()
+    start = start_time.date() if hasattr(start_time, "date") else start_time
     events = []
-    for item in daily:
+    for item in daily_plan:
         day = item.get("day")
         event_date = (start + timedelta(days=day - 1)).isoformat()
         slot = recommend_slot(item.get("task", ""))

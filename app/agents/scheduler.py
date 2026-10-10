@@ -30,6 +30,7 @@ class SchedulerState(TypedDict):
     # 上下文
     plan_goal: str
     daily_plan: list[dict]
+    start_time: object
     weather: Optional[dict]
     # 产出
     events: list[dict]
@@ -93,19 +94,17 @@ def load_context(state: SchedulerState):
         )
 
     print(f"目标:{goal}，模式:{state['mode']}，天气:{weather}")
-    return {"plan_goal": goal, "daily_plan": daily, "weather": weather}
+    return {"plan_goal": goal, "daily_plan": daily, "start_time": p.start_time, "weather": weather}
 
 
 def make_schedule(state: SchedulerState):
     print("\n=== [Scheduler] make_schedule 排日程 ===")
-    db = SessionLocal()
-    try:
-        p = db.query(Plan).filter(Plan.id == state["plan_id"]).first()
-        events, ics_text = build_plan_schedule(p)
-    finally:
-        db.close()
+    events, ics_text = build_plan_schedule(
+        state["daily_plan"], state["start_time"]
+    )
     print(f"排出 {len(events)} 个时段")
     return {"events": events, "ics_text": ics_text, "saved": True}
+
 
 def make_adjustment(state: SchedulerState):
     print("\n=== [Scheduler] make_adjustment 生成调整 ===")
@@ -172,7 +171,7 @@ def finalize(state: SchedulerState):
             p.daily_plan = json.dumps(new_plan, ensure_ascii=False)
             db.commit()
             print(f"调整落库，{len(changes)} 条操作")
-            events, ics_text = build_plan_schedule(p)   # 基于新计划重排日程
+            events, ics_text = build_plan_schedule(new_plan, p.start_time)   # 基于新计划重排日程
         else:
             events, ics_text = [], ""
     finally:

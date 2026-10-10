@@ -9,3 +9,10 @@ anthropic==1.2.0
 httpx==0.28.1
 python-jose[cryptography]
 python-multipart
+langgraph
+langchain-core
+streamlit
+pandas
+plotly
+requests
+pytest
