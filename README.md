@@ -2,6 +2,7 @@
 
 个人成长助手后端 API。基于 FastAPI + MySQL + SQLAlchemy，支持用户注册登录、成长计划管理、打卡记录与统计、AI 目标拆解。
 > 基于 LangGraph 的个人成长目标拆解与执行跟踪 Agent：输入自然语言目标，自动判断有效性、拆解为周/日计划、校验后存入 MySQL，配套 Streamlit 交互前端与 FastAPI 后端。
+> 📖 新手上手请先看 [MVP 使用手册](./MVP_GUIDE.md)
 
 ## ✨ 项目亮点
 
@@ -25,52 +26,45 @@
 | 校验       | Pydantic 2                                  |
 | Agent 编排 | LangGraph（StateGraph + 条件边 + 循环校验） |
 | 前端       | Streamlit（表单 + session_state）           |
-| 本地大模型 | Ollama（gemma3:4b）                          |
+| 本地大模型 | Ollama（gemma3:4b）                         |
 
 ## 目录结构
 
 ```
 Person_Growth_Agent/
 ├── app/
-│   ├── agents/                  # LangGraph 双 Agent
+│   ├── agents/                  # LangGraph 多 Agent
 │   │   ├── common.py            # 公共：LLM 工厂 + JSON 解析
 │   │   ├── goal_breakdown.py    # 目标拆解图：parse→闸门→周/日→校验→存库
 │   │   ├── tracking_agent.py    # 执行跟踪图：打卡→进度→反馈→动态调整
-│   │   └── app.py               # Streamlit 主入口（tabs 整合）
-│   └── tests/                   # pytest 测试（单元 + 集成）
-│       ├── test_goal_parser.py
-│       ├── test_agent_nodes.py
-│       ├── test_e2e.py
-│       └── test_integration_flow.py
-│   ├── main.py                  # 应用入口，挂载路由 + 全局异常
-│   ├── database.py              # 数据库连接 / Session
-│   ├── deps.py                  # 公共依赖（get_current_user 鉴权）
+│   │   ├── scheduler.py         # 调度调整：天气感知 + 排程 + 动态调整
+│   │   ├── calendar.py          # 日历工具：时段推荐 + .ics 导出
+│   │   ├── weather.py           # 天气查询（Open-Meteo）
+│   │   ├── rules_engine.py      # 规则引擎
+│   │   ├── app.py               # Streamlit 主入口（tabs 整合）
+│   │   └── config/
+│   │       └── adjustment_rules.yaml
 │   ├── core/
 │   │   ├── config.py            # 配置（.env 读取）
 │   │   ├── security.py          # 密码哈希 + JWT 签发/验证
-│   │   └── exceptions.py        # 自定义异常体系 + 全局处理器
-│   ├── models/                  # SQLAlchemy 模型
-│   │   ├── user.py
-│   │   ├── plan.py
-│   │   ├── checkin.py
-│   │   └── memory.py            # 预留，未启用
+│   │   ├── exceptions.py        # 自定义异常体系 + 全局处理器
+│   │   ├── resilience.py        # 重试 / 降级 / 兜底
+│   │   └── rules.py             # YAML 规则加载
+│   ├── crud/                    # 数据库操作层（user/plan/checkin）
+│   ├── llm/
+│   │   └── client.py            # LLM 调用封装（重试/超时/限流）
+│   ├── models/                  # SQLAlchemy 模型（user/plan/checkin/memory）
+│   ├── routers/                # API 路由（auth/users/plans/checkins）
 │   ├── schemas/                 # Pydantic 请求/响应模型
-│   │   ├── user.py
-│   │   ├── plan.py
-│   │   └── checkin.py
-│   ├── crud/                    # 数据库操作层
-│   │   ├── user.py
-│   │   ├── plan.py
-│   │   └── checkin.py
-│   ├── routers/                 # API 路由层
-│   │   ├── auth.py              # 注册 / 登录
-│   │   ├── users.py             # /users/me
-│   │   ├── plans.py             # 计划 CRUD + AI 拆解
-│   │   └── checkins.py          # 打卡 CRUD + 统计
-│   └── llm/
-│       └── client.py            # LLM 调用封装（重试/超时/限流）
+│   ├── tests/                   # pytest 测试（单元 + 集成）
+│   ├── database.py              # 数据库连接 / Session
+│   ├── deps.py                  # 公共依赖（get_current_user 鉴权）
+│   └── main.py                  # 应用入口，挂载路由 + 全局异常
 ├── alembic/                     # 数据库迁移
-├── .env                         # 环境变量（不提交到 git）
+├── calendars/                    # 导出的 .ics 日历文件
+├── rules.yaml                   # 时段推荐 / 分类关键词规则
+├── run_mvp.py                    # MVP 三 Agent 协同演示入口
+├── .env.example                  # 环境变量模板
 ├── requirements.txt
 └── README.md
 ```
@@ -85,7 +79,7 @@ pip install -r requirements.txt
 
 ### 2. 配置环境变量
 
-创建 `.env` 文件：
+创建 `.env` 文件（可参考 `.env.example`）：
 
 ```env
 DATABASE_URL=mysql+pymysql://root:password@localhost:3306/Person_Growth_Agent
@@ -95,8 +89,13 @@ ACCESS_TOKEN_EXPIRE_MINUTES=30
 LLM_API_KEY=your-api-key
 LLM_BASE_URL=https://api.teamorouter.cn
 LLM_MODEL=glm-5.3-flash
-LLM_TIMEOUT=60
-LLM_MAX_RETRIES=3
+LLM_TIMEOUT=30
+LLM_MAX_RETRIES=2
+
+# LangGraph agents 用的模型（本地 Ollama）
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=gemma3:4b
 ```
 
 ### 3. 初始化数据库
@@ -105,7 +104,7 @@ LLM_MAX_RETRIES=3
 alembic upgrade head
 ```
 
-### 4. 启动服务
+### 4. 启动后端服务
 
 ```bash
 uvicorn app.main:app --reload
@@ -213,23 +212,26 @@ uvicorn app.main:app --reload
 
 ## Agent 架构（模块说明）
 
-系统由两个独立 LangGraph Agent 组成，通过 MySQL `plan` 表解耦：
+系统由多个 LangGraph Agent 组成，通过 MySQL `plan` 表解耦：
 
-| Agent | 文件 | 阶段 | 频率 | checkpointer |
-| ----- | ---- | ---- | ---- | ------------ |
-| 目标拆解 | `goal_breakdown.py` | 规划：目标 → 周/日计划 | 一次性 | 无 |
-| 执行跟踪 | `tracking_agent.py` | 执行：打卡 → 反馈/调整 | 每日反复 | InMemorySaver |
+| Agent    | 文件                | 阶段                       | 频率     | checkpointer  |
+| -------- | ------------------- | -------------------------- | -------- | ------------- |
+| 目标拆解 | `goal_breakdown.py` | 规划：目标 → 周/日计划     | 一次性   | 无            |
+| 执行跟踪 | `tracking_agent.py` | 执行：打卡 → 反馈/调整     | 每日反复 | InMemorySaver |
+| 调度调整 | `scheduler.py`      | 排程 + 天气感知 + 动态调整 | 按需     | InMemorySaver |
 
 ```mermaid
 flowchart TD
     G[自然语言目标] --> A[目标拆解 Agent]
     A --> P[(plan 表)]
     P --> B[执行跟踪 Agent]
+    P --> S[调度调整 Agent]
     B -->|严重落后| C[生成结构化操作]
     C --> D[interrupt 等人确认]
     D -->|确认| E[写回 plan]
     B -->|正常/轻微落后| F[保存打卡]
     E --> F
+    S -->|天气差/进度落后| C
 ```
 
 ### 目标拆解 Agent
@@ -243,12 +245,20 @@ flowchart TD
 - 正常 / 轻微落后：直接 `save_checkin`
 - 严重落后：`maybe_adjust_plan` → `confirm_adjustment`（interrupt）→ `apply_adjustment` → `save_checkin`
 
+### 调度调整 Agent
+
+`load_context`（读计划 + 查天气）→ 按模式分支：
+- `schedule`：`make_schedule` → 推荐时段 + 导出 `.ics`
+- `adjust`：`make_adjustment`（LLM 出结构化操作）→ `confirm_adjustment`（interrupt）→ `finalize`（幂等写回 + 重排日程）
+
 ### 动态调整机制
 
 - LLM 输出结构化操作，而非自由文本：
   - `postpone`（延期，需提供 `to_day`）
   - `reduce`（减量，需提供 `new_content`）
-- `apply_changes` 是**纯函数**（计划 + 操作 → 新计划），`apply_adjustment` 节点负责幂等写回
+  - `lower_intensity`（降强度）
+  - `switch_type`（换类型，需提供 `new_type` + `new_content`）
+- `apply_changes` 是**纯函数**（计划 + 操作 → 新计划），`finalize` 节点负责幂等写回
 - 用户取消则不改动计划，仅保存打卡
 
 ### 关键设计原则
@@ -258,7 +268,7 @@ flowchart TD
 - **人机协同**：checkpoint 存档 + interrupt 暂停，确认后恢复
 - **公共复用**：`common.py` 统一 LLM 工厂与 JSON 解析
 
-### 5. 启动目标拆解 Agent 前端
+## 启动前端与演示
 
 确保本地 Ollama 已拉取模型：
 
@@ -266,3 +276,17 @@ flowchart TD
 ollama pull gemma3:4b
 ollama serve
 ```
+
+启动 Streamlit 交互前端：
+
+```bash
+streamlit run app/agents/app.py
+```
+
+跑三 Agent 协同命令行演示：
+
+```bash
+python -X utf8 run_mvp.py
+```
+
+> 详细操作步骤见 [MVP_GUIDE.md](./MVP_GUIDE.md)
