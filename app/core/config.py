@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
 
+    # LangGraph agents 的模型选择（本地 Ollama / 兼容 OpenAI 的远程）
+    llm_provider: str = "ollama"
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "gemma3:4b"
+    agent_temperature: float = 0.3
+
 
 @lru_cache
 def get_settings() -> Settings:

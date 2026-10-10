@@ -14,6 +14,9 @@ from app.database import SessionLocal
 from app.models.plan import Plan
 from app.models.checkin import CheckIn
 from .common import make_llm, parse_json
+from app.core.rules import get_rules
+from app.core.resilience import with_retry
+import requests
 from .weather import is_outdoor_task, get_weather, is_weather_unfriendly, CITY_COORDS
 import copy
 
@@ -93,10 +96,14 @@ def fetch_weather(state: TrackingState):
         return {"weather": None, "weather_warning": False}
 
     lat, lon = CITY_COORDS[city]
-    try:
-        w = get_weather(lat, lon, state["today"])
-    except Exception as e:
-        print("天气查询失败：", e)
+    # 瞬时错误重试，全失败降级为 None（不阻断打卡）
+    w = with_retry(
+        get_weather, lat, lon, state["today"],
+        retries=2, base_delay=0.5,
+        retry_on=(requests.RequestException, ConnectionError, TimeoutError),
+        fallback=lambda e: (print("天气查询失败：", e), None)[1],
+    )
+    if w is None:
         return {"weather": None, "weather_warning": False}
 
     warning = is_weather_unfriendly(w)
@@ -219,20 +226,22 @@ def calculate_progress(state: TrackingState):
         streak += 1
         d -= timedelta(days=1)     # 往前一天
 
-    # —— 偏差等级 ——
-    if rate >= 0.8:
+    # —— 偏差等级（阈值来自规则库）——
+    p = get_rules()["progress"]
+    if rate >= p["on_track_above"]:
         deviation = "on_track"
-    elif rate >= 0.4:
+    elif rate >= p["slightly_behind_above"]:
         deviation = "slightly_behind"
     else:
         deviation = "significantly_behind"
 
-    # —— 趋势：今天 vs 历史平均（±10% 算波动）——
+    # —— 趋势：今天 vs 历史平均（差值阈值来自规则库）——
+    delta = p["trend_delta"]
     if history:
         avg = sum(h["rate"] for h in history) / len(history)
-        if rate > avg + 0.1:
+        if rate > avg + delta:
             trend = "up"
-        elif rate < avg - 0.1:
+        elif rate < avg - delta:
             trend = "down"
         else:
             trend = "flat"

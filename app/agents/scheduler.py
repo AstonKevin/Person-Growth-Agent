@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """第三个 Agent：调度调整 Agent。
-负责：最佳时段推荐、日历(.ics)导出、结合天气与偏差的动态调整。
+结合天气与执行偏差，生成调整建议，经用户确认后写回计划；
+时段推荐与日历(.ics)导出由 calendar 工具模块承担。
 """
-import uuid
 import json
-from typing import TypedDict, Optional, Literal
+from typing import TypedDict, Optional
 from pydantic import ValidationError
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import InMemorySaver
@@ -13,12 +13,11 @@ from langchain_core.messages import HumanMessage
 from app.database import SessionLocal
 from app.models.plan import Plan
 from .common import make_llm, parse_json
-from .weather import get_weather, is_weather_unfriendly, CITY_COORDS
+from .weather import get_weather, CITY_COORDS
 from .tracking_agent import PlanChange, apply_changes
-
-from datetime import timedelta
-
-from .weather import is_outdoor_task
+from .calendar import build_plan_schedule
+from app.core.resilience import with_retry
+import requests
 
 class SchedulerState(TypedDict):
     # 输入
@@ -81,98 +80,21 @@ def load_context(state: SchedulerState):
     finally:
         db.close()
 
-    # 查天气（城市有效才查）
+    # 查天气（城市有效才查）：瞬时错误重试，全失败降级为 None（不阻断流程）
     weather = None
     city = state.get("city") or "南京"
     if city in CITY_COORDS:
         lat, lon = CITY_COORDS[city]
-        try:
-            weather = get_weather(lat, lon, state["today"])
-        except Exception as e:
-            print("天气查询失败:", e)
+        weather = with_retry(
+            get_weather, lat, lon, state["today"],
+            retries=2, base_delay=0.5,
+            retry_on=(requests.RequestException, ConnectionError, TimeoutError),
+            fallback=lambda e: (print("天气查询失败:", e), None)[1],
+        )
 
     print(f"目标:{goal}，模式:{state['mode']}，天气:{weather}")
     return {"plan_goal": goal, "daily_plan": daily, "weather": weather}
 
-
-# 任务类型 -> 推荐最佳时段（start, end）
-# 依据：早晨记忆好、上午专注、傍晚身体机能高峰、清晨户外凉爽、晚上复盘
-CATEGORY_SLOTS = {
-    "记忆/学习": ("07:00", "08:00"),
-    "深度专注": ("09:00", "11:00"),
-    "锻炼/健身": ("17:00", "18:00"),
-    "户外运动": ("06:30", "07:30"),
-    "复盘/总结": ("20:00", "21:00"),
-}
-
-
-def classify_task(task_text: str) -> str:
-    """根据任务文本判断类型"""
-    if any(k in task_text for k in ["复盘", "总结", "规划", "整理"]):
-        return "复盘/总结"
-    if any(k in task_text for k in ["跑", "锻炼", "健身", "训练", "运动", "游泳"]):
-        return "户外运动" if is_outdoor_task(task_text) else "锻炼/健身"
-    if any(k in task_text for k in ["背", "单词", "记忆", "阅读", "学习"]):
-        return "记忆/学习"
-    return "深度专注"
-
-
-def recommend_slot(task_text: str) -> dict:
-    """推荐一个任务的最佳时段"""
-    category = classify_task(task_text)
-    start, end = CATEGORY_SLOTS[category]
-    return {"category": category, "start": start, "end": end}
-
-
-def _ics_dt(date_str: str, hhmm: str) -> str:
-    """日期+时间转 iCalendar 格式：2026-10-11 + 07:00 -> 20261011T070000"""
-    h, m = hhmm.split(":")
-    return f"{date_str.replace('-', '')}T{h}{m}00"
-
-
-def build_ics(events: list[dict]) -> str:
-    """
-    events: [{"date", "task", "start", "end", "category"}]
-    """
-    lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//Person Growth Agent//CN//",
-        "CALSCALE:GREGORIAN",
-    ]
-    for ev in events:
-        lines += [
-            "BEGIN:VEVENT",
-            f"UID:{uuid.uuid4()}@person-growth-agent",
-            f"DTSTART:{_ics_dt(ev['date'], ev['start'])}",
-            f"DTEND:{_ics_dt(ev['date'], ev['end'])}",
-            f"SUMMARY:{ev['task']}",
-            f"DESCRIPTION:推荐类型：{ev.get('category', '')}",
-            "END:VEVENT",
-        ]
-    lines.append("END:VCALENDAR")
-    return "\r\n".join(lines)
-
-def build_plan_schedule(plan) -> tuple[list[dict], str]:
-    """
-    给一个 plan 排完整日程：每个任务按 day 算实际日期、按类型推荐时段。
-    返回 (events, ics_text)
-    """
-    daily = json.loads(plan.daily_plan)
-    start = plan.start_time.date()
-    events = []
-    for item in daily:
-        day = item.get("day")
-        event_date = (start + timedelta(days=day - 1)).isoformat()
-        slot = recommend_slot(item.get("task", ""))
-        events.append({
-            "date": event_date,
-            "task": item.get("task"),
-            "start": slot["start"],
-            "end": slot["end"],
-            "category": slot["category"],
-        })
-    return events, build_ics(events)
 
 def make_schedule(state: SchedulerState):
     print("\n=== [Scheduler] make_schedule 排日程 ===")

@@ -1,0 +1,66 @@
+# =========================================================
+# 动态调整规则库 adjustment_rules.yaml
+# ---------------------------------------------------------
+# 作用：把“什么时候触发调整”“触发后怎么调整”的规则，
+#       从代码 / Prompt 里抽出来集中管理。
+# 执行顺序：确定性规则优先（命中第一条即停），
+#           规则未覆盖的情况再交给 LLM（fallback）。
+# =========================================================
+
+meta:
+  version: 1
+  description: Personal-Growth-Agent 动态调整规则
+
+# ---------- 一、阈值：统一在项目根 rules.yaml 管理 ----------
+# 偏差等级、天气不宜户外、连续未完成天数等阈值都在 rules.yaml，
+# 规则引擎通过 get_rules() 读取，避免同一数字两处定义。
+
+# ---------- 二、规则：条件 → 动作（按 priority 顺序） ----------
+# 条件字段：
+#   weather_warning : true/false       是否不宜户外
+#   task_category   : outdoor/indoor   当前任务类型
+#   deviation       : on_track/slightly_behind/significantly_behind
+#   trend           : up/down/flat     完成率趋势
+#   consecutive_miss: true/false       是否连续未完成
+# 动作即 PlanChange 支持的四种：switch_type / reduce / lower_intensity / postpone
+rules:
+  - name: 天气差_户外改室内
+    priority: 1
+    when:
+      weather_warning: true
+      task_category: outdoor
+    then:
+      action: switch_type
+      new_type: 室内
+      new_content: "室内替代{task}（核心动作练习）"
+
+  - name: 严重落后_减量
+    priority: 2
+    when:
+      deviation: significantly_behind
+      weather_warning: false
+    then:
+      action: reduce
+      new_content: "减量完成{task}（只做核心一半）"
+
+  - name: 轻落后且下滑_降强度
+    priority: 3
+    when:
+      deviation: slightly_behind
+      trend: down
+    then:
+      action: lower_intensity
+      new_content: "低强度完成{task}（轻松版）"
+
+  - name: 连续未完成_延期
+    priority: 4
+    when:
+      consecutive_miss: true
+    then:
+      action: postpone
+      delay_days: 2
+
+# ---------- 三、兜底：规则未命中时交给 LLM ----------
+fallback:
+  use_llm: true
+  note: 确定性规则未覆盖，由 LLM 结合上下文判断
