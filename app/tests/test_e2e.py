@@ -5,6 +5,7 @@
 """
 import pytest
 from app.agents.goal_breakdown import graph
+from app.agents.common import make_llm
 from app.database import SessionLocal
 from app.models.plan import Plan
 
@@ -12,12 +13,13 @@ pytestmark = pytest.mark.integration
 
 
 def _invoke(goal: str) -> dict:
+    cfg = {"configurable": {"llm": make_llm(), "user_id": 1}}
     return graph.invoke({
         "goal": goal, "messages": [], "weekly_plans": [], "daily_plans": [],
         "is_valid": False, "validation_feedback": "",
         "retry_count": 0, "final_plan": {}, "struct_goal": None,
         "saved_plan_id": None, "save_confirmed": False, "save_error": "",
-    })
+    }, cfg)
 
 
 def _plan_count() -> int:

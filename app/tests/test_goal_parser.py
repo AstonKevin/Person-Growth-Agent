@@ -38,8 +38,9 @@ def test_weeks_out_of_range_raises():
     ("一个月减5公斤", "健身", (3, 6)),
 ])
 def test_real_goal_accuracy(raw, expect_domain_kw, weeks_range):
-    from app.agents.goal_breakdown import llm, PARSE_GOAL_PROMPT
-    resp = llm.invoke([HumanMessage(content=PARSE_GOAL_PROMPT.format(goal=raw))])
+    from app.agents.goal_breakdown import PARSE_GOAL_PROMPT
+    from app.agents.common import make_llm
+    resp = make_llm().invoke([HumanMessage(content=PARSE_GOAL_PROMPT.format(goal=raw))])
     sg = extract_structured_goal(raw, resp.content)
     assert sg.title.strip() != ""
     assert weeks_range[0] <= sg.duration_weeks <= weeks_range[1], \

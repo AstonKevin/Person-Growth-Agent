@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
 
+    # BYOK 凭证加密：不填则从 SECRET_KEY 派生（生产建议显式设置独立的合法 Fernet key）
+    credential_encryption_key: str | None = None
+
     # LangGraph agents 的模型选择（本地 Ollama / 兼容 OpenAI 的远程）
     llm_provider: str = "ollama"
     ollama_base_url: str = "http://localhost:11434"

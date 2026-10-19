@@ -4,9 +4,11 @@ __pycache__/
 .venv/
 venv/
 
-# 环境变量与密钥（绝不提交）
+# 环境变量与密钥（绝不提交真实密钥）
 .env
 .env.*
+!.env.example
+!.env.prod.example
 
 # IDE
 .vscode/

@@ -1,0 +1,10 @@
+# {$DOMAIN} 会从环境变量 DOMAIN 读取（在服务器 .env 里设置，如 example.com）
+# Caddy 自动向 Let's Encrypt 申请并续期 HTTPS 证书，无需手动操作
+
+app.{$DOMAIN} {
+	reverse_proxy web:8501
+}
+
+api.{$DOMAIN} {
+	reverse_proxy api:8000
+}

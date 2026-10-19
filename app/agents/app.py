@@ -22,6 +22,22 @@ from app.agents.goal_breakdown import graph as goal_graph
 from app.agents.tracking_agent import graph as tracking_graph
 from app.agents.weather import CITY_COORDS, get_weather, is_outdoor_task, is_weather_unfriendly
 from langgraph.types import Command
+from app.core.security import verify_password
+from app.crud.user import (
+    get_user_by_name,
+    create_user,
+    get_users_with_provider_flag,
+    update_user_admin,
+    count_user_stats,
+)
+from app.schemas.user import UserCreate
+from app.agents.common import resolve_user_channel, _normalize_openai_base
+from app.crud.provider import get_provider_by_user, upsert_provider, delete_provider
+from app.schemas.provider import ProviderIn
+from app.routers.providers import _friendly_error
+from app.crud import usage as usage_crud
+from app.core.config import get_settings
+import openai
 
 # ============ 2. 页面基础配置与全局状态 ============
 st.set_page_config(page_title="个人成长 Agent", layout="wide")
@@ -122,8 +138,96 @@ def load_checkin_history(plan_id):
         db.close()
 
 
+# ============ 3.5 登录 / 注册 ============
+def login_user(name, password):
+    """校验用户名密码，成功返回 (user, None)，失败返回 (None, 错误信息)。"""
+    db = SessionLocal()
+    try:
+        user = get_user_by_name(db, name)
+        if user and verify_password(password, user.password_hash):
+            if not user.is_active:
+                return None, "账号已被停用，请联系管理员"
+            db.expunge(user)  # 分离出会话，避免 session 关闭后读取失效
+            return user, None
+        return None, "用户名或密码错误"
+    finally:
+        db.close()
+
+
+def register_user(name, password):
+    """注册新用户，成功返回 (user, None)。"""
+    db = SessionLocal()
+    try:
+        if get_user_by_name(db, name):
+            return None, "用户名已存在"
+        user = create_user(db, UserCreate(name=name, password=password))
+        db.expunge(user)
+        return user, None
+    finally:
+        db.close()
+
+
+def render_auth():
+    """未登录时渲染登录 / 注册页。"""
+    st.title("🔐 个人成长 Agent")
+    t_login, t_reg = st.tabs(["登录", "注册"])
+
+    with t_login:
+        with st.form("login_form"):
+            name = st.text_input("用户名")
+            password = st.text_input("密码", type="password")
+            login = st.form_submit_button("登录")
+        if login:
+            if not name.strip() or not password:
+                st.error("请输入用户名和密码")
+            else:
+                user, err = login_user(name.strip(), password)
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.current_user = user
+                    st.rerun()
+
+    with t_reg:
+        with st.form("register_form"):
+            r_name = st.text_input("用户名（至少 2 个字符）")
+            r_pwd = st.text_input("密码（至少 6 位）", type="password")
+            r_pwd2 = st.text_input("确认密码", type="password")
+            reg = st.form_submit_button("注册")
+        if reg:
+            if len(r_name.strip()) < 2:
+                st.error("用户名至少 2 个字符")
+            elif len(r_pwd) < 6:
+                st.error("密码至少 6 位")
+            elif r_pwd != r_pwd2:
+                st.error("两次输入的密码不一致")
+            else:
+                user, err = register_user(r_name.strip(), r_pwd)
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.current_user = user
+                    st.rerun()
+
+
+# 登录拦截：未登录只显示登录页，不渲染后面的主功能
+st.session_state.setdefault("current_user", None)
+if st.session_state.current_user is None:
+    render_auth()
+    st.stop()
+
+
 # ============ 4. 侧边栏 ============
 with st.sidebar:
+    cu = st.session_state.current_user
+    role_tag = "管理员" if cu.role == "admin" else "普通用户"
+    st.header(f"👤 {cu.name}")
+    st.caption(f"角色：{role_tag}")
+    if st.button("🚪 退出登录"):
+        st.session_state.current_user = None
+        st.rerun()
+    st.divider()
+
     st.header("使用说明")
     st.write("🎯 **目标拆解**：填目标 → AI 拆解 → 存库。")
     st.write("✅ **每日打卡**：勾选/文字 → 计算进度 → 反馈。")
@@ -240,6 +344,18 @@ def show_checkin_result(r):
 
 # ============ 6. Tab 1：目标拆解 ============
 def render_goal_tab():
+    _db = SessionLocal()
+    try:
+        user_prov = get_provider_by_user(_db, st.session_state.current_user.id)
+    finally:
+        _db.close()
+
+    if user_prov:
+        st.info(f"💡 当前调用通道：**用户自带模型** `{user_prov.model}`（{user_prov.base_url}）")
+    else:
+        s = get_settings()
+        st.caption(f"💡 当前调用通道：**平台默认通道** `{s.llm_model}`（可在「⚙️ 个人设置」中配置自带 Key）")
+
     with st.form("goal_form"):
         goal = st.text_input("你的成长目标", placeholder="例如：3个月拿到暑期实习offer")
         submitted = st.form_submit_button(
@@ -261,6 +377,22 @@ def render_goal_tab():
         else:
             st.session_state.running = True
             with st.spinner("正在理解目标、拆解并保存..."):
+                # 按当前用户解析 LLM 通道：有自带 key 用自带的，否则走平台默认
+                _db = SessionLocal()
+                try:
+                    _llm, _model, _provider = resolve_user_channel(
+                        _db, st.session_state.current_user
+                    )
+                finally:
+                    _db.close()
+                _cfg = {
+                    "configurable": {
+                        "llm": _llm,
+                        "user_id": st.session_state.current_user.id,
+                        "model": _model,
+                        "provider": _provider,
+                    }
+                }
                 result = goal_graph.invoke(
                     {
                         "goal": goal,
@@ -275,7 +407,8 @@ def render_goal_tab():
                         "saved_plan_id": None,
                         "save_confirmed": False,
                         "save_error": "",
-                    }
+                    },
+                    _cfg,
                 )
             st.session_state.running = False
             st.session_state.last_result = result
@@ -465,9 +598,252 @@ def render_checkin_tab():
 
 
 
+# ============ 7.8 连通性测试辅助 ============
+def test_provider_connection(base_url: str, api_key: str, model: str) -> tuple[bool, str]:
+    """使用填写的配置发送微型请求验证连通性。"""
+    try:
+        client = openai.OpenAI(
+            api_key=api_key,
+            base_url=_normalize_openai_base(base_url),
+            timeout=20,
+        )
+        client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=5,
+        )
+        return True, "连接成功！凭证有效。"
+    except Exception as exc:
+        return False, _friendly_error(exc)
+
+
+# ============ 7.9 Tab 3：个人设置 (BYOK) ============
+def render_settings_tab():
+    st.subheader("⚙️ 个人设置：大模型接入配置 (BYOK)")
+    st.caption("支持配置您自己的 OpenAI 兼容接口（如 OpenAI / DeepSeek / 智谱 / 中转平台）。")
+    st.caption("🔒 **安全保障**：您的 API Key 将经 Fernet 强加密后入库，**绝不回显、管理员也无权查看**。")
+
+    db = SessionLocal()
+    try:
+        current_prov = get_provider_by_user(db, st.session_state.current_user.id)
+    finally:
+        db.close()
+
+    if current_prov:
+        st.success(
+            f"✅ **已配置自带模型**：`{current_prov.model}` ｜ 服务地址：`{current_prov.base_url}`"
+        )
+    else:
+        s = get_settings()
+        st.info(f"ℹ️ **当前使用平台免费默认通道**：`{s.llm_model}`")
+
+    st.markdown("---")
+
+    default_base_url = current_prov.base_url if current_prov else "https://api.openai.com"
+    default_model = current_prov.model if current_prov else "gpt-4o-mini"
+
+    with st.form("settings_form"):
+        base_url = st.text_input("API Base URL（不带 /v1，如 https://api.openai.com）", value=default_base_url)
+        api_key = st.text_input(
+            "API Key（为保障安全不回显，若需修改或首次配置请填入完整 Key）",
+            type="password",
+            placeholder="sk-...",
+        )
+        model = st.text_input("模型名称（如 gpt-4o-mini、deepseek-chat 等）", value=default_model)
+
+        c_test, c_save = st.columns(2)
+        test_clicked = c_test.form_submit_button("🔌 测试连接")
+        save_clicked = c_save.form_submit_button("💾 保存配置")
+
+    if test_clicked:
+        if not api_key.strip():
+            st.error("测试连接必须输入 API Key。")
+        elif not base_url.strip() or not model.strip():
+            st.error("请完整填写 Base URL 与模型名称。")
+        else:
+            with st.spinner("正在发送微型测试请求验证..."):
+                ok, msg = test_provider_connection(base_url.strip(), api_key.strip(), model.strip())
+            if ok:
+                st.success(f"🎉 {msg}")
+            else:
+                st.error(f"❌ 连通失败：{msg}")
+
+    if save_clicked:
+        if not api_key.strip():
+            st.error("保存配置必须输入 API Key。")
+        elif not base_url.strip() or not model.strip():
+            st.error("请完整填写 Base URL 与模型名称。")
+        else:
+            with st.spinner("正在加密并保存配置..."):
+                db = SessionLocal()
+                try:
+                    prov_in = ProviderIn(
+                        provider="openai",
+                        base_url=base_url.strip(),
+                        api_key=api_key.strip(),
+                        model=model.strip(),
+                    )
+                    upsert_provider(db, st.session_state.current_user.id, prov_in)
+                    st.success("✅ 配置保存成功！后续目标拆解将自动采用您的自带模型。")
+                except Exception as exc:
+                    st.error(f"❌ 保存失败: {exc}")
+                finally:
+                    db.close()
+            st.rerun()
+
+    if current_prov:
+        st.markdown("---")
+        st.write("如不再需要自带 Key，可一键清除并恢复为平台免费模型：")
+        if st.button("🗑️ 清除自定义配置（恢复平台默认）"):
+            db = SessionLocal()
+            try:
+                delete_provider(db, st.session_state.current_user.id)
+                st.success("已清除自定义配置，已恢复平台默认通道。")
+            finally:
+                db.close()
+            st.rerun()
+
+
+# ============ 7.10 Tab 4：管理后台 (仅 Admin 可见) ============
+def render_admin_tab():
+    cu = st.session_state.current_user
+    if cu.role != "admin":
+        st.error("⛔ 权限不足：此页面仅限系统管理员访问。")
+        return
+
+    st.subheader("🛠️ 系统管理后台")
+    st.caption("🔒 严格铁律：管理员仅可查阅用量元数据与系统状态，不可查阅用户目标、对话内容及密钥明文。")
+
+    db = SessionLocal()
+    try:
+        user_stats = count_user_stats(db)
+        totals = usage_crud.total_counts(db)
+        models = usage_crud.counts_by_model(db)
+        daily = usage_crud.counts_by_day(db, days=30)
+        users_list = get_users_with_provider_flag(db)
+    finally:
+        db.close()
+
+    total_req = totals["total"]
+    err_req = totals["error"]
+    err_rate = (err_req / total_req * 100) if total_req > 0 else 0.0
+    total_tokens = totals["prompt_tokens"] + totals["completion_tokens"]
+
+    # 1. 指标概览
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("总注册用户", f"{user_stats['total']} 人")
+    m2.metric("当前活跃用户", f"{user_stats['active']} 人")
+    m3.metric("总调用请求", f"{total_req} 次")
+    m4.metric("请求错误率", f"{err_rate:.1f}%", delta=f"{err_req} 次失败", delta_color="inverse")
+    m5.metric("累计消耗 Token", f"{total_tokens:,}")
+
+    st.markdown("---")
+
+    # 2. 图表展示
+    c_chart1, c_chart2 = st.columns(2)
+
+    with c_chart1:
+        st.write("**📈 近 30 天调用趋势**")
+        if daily:
+            df_daily = pd.DataFrame(daily)
+            fig_trend = go.Figure()
+            fig_trend.add_trace(go.Scatter(
+                x=df_daily["day"], y=df_daily["total"],
+                name="总请求", mode="lines+markers", line=dict(color="#4f46e5", width=2)
+            ))
+            fig_trend.add_trace(go.Scatter(
+                x=df_daily["day"], y=df_daily["error"],
+                name="失败请求", mode="lines+markers", line=dict(color="#ef4444", width=2)
+            ))
+            fig_trend.update_layout(
+                xaxis_title="日期", yaxis_title="次数",
+                height=320, margin=dict(l=10, r=10, t=30, b=10),
+            )
+            st.plotly_chart(fig_trend, use_container_width=True)
+        else:
+            st.caption("暂无用量记录。")
+
+    with c_chart2:
+        st.write("**🤖 各模型使用分布**")
+        if models:
+            df_models = pd.DataFrame(models)
+            fig_model = go.Figure(go.Bar(
+                x=df_models["model"],
+                y=df_models["count"],
+                marker_color="#06b6d4",
+                text=df_models["count"],
+                textposition="auto",
+            ))
+            fig_model.update_layout(
+                xaxis_title="模型", yaxis_title="调用次数",
+                height=320, margin=dict(l=10, r=10, t=30, b=10),
+            )
+            st.plotly_chart(fig_model, use_container_width=True)
+        else:
+            st.caption("暂无模型记录。")
+
+    st.markdown("---")
+
+    # 3. 用户管理表格与操作
+    st.write("👥 **用户列表与权限管理**")
+    if users_list:
+        df_u = pd.DataFrame(users_list).rename(
+            columns={
+                "id": "用户 ID",
+                "name": "用户名",
+                "role": "角色",
+                "is_active": "启用状态",
+                "has_provider": "已配 BYOK",
+                "create_time": "注册时间",
+            }
+        )
+        df_u["角色"] = df_u["角色"].map({"admin": "👑 管理员", "user": "👤 普通用户"})
+        df_u["启用状态"] = df_u["启用状态"].map({True: "🟢 启用", False: "🔴 停用"})
+        df_u["已配 BYOK"] = df_u["已配 BYOK"].map({True: "✅ 是", False: "⚪ 否"})
+        st.dataframe(df_u, use_container_width=True, hide_index=True)
+
+        st.write("**修改用户权限 / 启用状态**")
+        with st.form("admin_user_form"):
+            user_options = {u["id"]: f"[ID {u['id']}] {u['name']} ({u['role']})" for u in users_list}
+            selected_uid = st.selectbox("选择目标用户", options=list(user_options.keys()), format_func=lambda uid: user_options[uid])
+            target_user = next((u for u in users_list if u["id"] == selected_uid), None)
+
+            c_role, c_active = st.columns(2)
+            new_role = c_role.selectbox("分配角色", options=["user", "admin"], index=0 if target_user and target_user["role"] == "user" else 1)
+            new_active = c_active.checkbox("账号启用", value=target_user["is_active"] if target_user else True)
+
+            submitted = st.form_submit_button("确认修改")
+
+        if submitted:
+            if selected_uid == cu.id and not new_active:
+                st.error("❌ 禁止停用当前登录的管理员账号！")
+            elif selected_uid == cu.id and new_role != "admin":
+                st.error("❌ 禁止取消自身的管理员权限！")
+            else:
+                db = SessionLocal()
+                try:
+                    update_user_admin(db, selected_uid, role=new_role, is_active=new_active)
+                    st.success(f"✅ 已成功更新用户 ID={selected_uid} 的状态与角色！")
+                except Exception as exc:
+                    st.error(f"❌ 更新失败: {exc}")
+                finally:
+                    db.close()
+                st.rerun()
+
+
 # ============ 8. 页面主入口渲染 ============
-tab1, tab2 = st.tabs(["🎯 目标拆解", "✅ 每日打卡"])
-with tab1:
+cu = st.session_state.current_user
+tab_names = ["🎯 目标拆解", "✅ 每日打卡", "⚙️ 个人设置"]
+if cu and cu.role == "admin":
+    tab_names.append("🛠️ 管理后台")
+
+tabs = st.tabs(tab_names)
+with tabs[0]:
     render_goal_tab()
-with tab2:
+with tabs[1]:
     render_checkin_tab()
+with tabs[2]:
+    render_settings_tab()
+if cu and cu.role == "admin" and len(tabs) > 3:
+    with tabs[3]:
+        render_admin_tab()

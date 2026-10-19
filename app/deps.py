@@ -7,7 +7,7 @@ from app.database import get_db
 from app.core.security import decode_access_token
 from app.crud.user import get_user_by_id
 from app.models.user import User
-from app.core.exceptions import UnauthorizedError
+from app.core.exceptions import ForbiddenError, UnauthorizedError
 
 # tokenUrl 指向登录接口地址，Swagger 的 Authorize 按钮靠它自动获取 token
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
@@ -25,4 +25,18 @@ def get_current_user(
     user = get_user_by_id(db, int(payload["sub"]))
     if not user:
         raise UnauthorizedError("用户不存在")
+    if not user.is_active:
+        raise UnauthorizedError("账号已被停用，请联系管理员")
     return user
+
+
+def get_current_admin(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """校验当前登录用户是否为管理员（role == 'admin'）且账号处于启用状态。
+    非管理员返回 403 Forbidden。"""
+    if not current_user.is_active:
+        raise ForbiddenError("账号已被停用")
+    if current_user.role != "admin":
+        raise ForbiddenError("权限不足，该接口仅管理员可访问")
+    return current_user

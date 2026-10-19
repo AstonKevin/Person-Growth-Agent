@@ -1,1 +1,1 @@
-from app.models import user,plan,memory,checkin
+from app.models import user,plan,memory,checkin,provider,usage

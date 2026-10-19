@@ -1,0 +1,86 @@
+services:
+  db:
+    image: mysql:8.0
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      MYSQL_DATABASE: Person_Growth_Agent
+    volumes:
+      - mysql_data:/var/lib/mysql
+    # 小内存机器：压低 InnoDB 缓冲和连接数，避免 MySQL 吃掉过多内存
+    command:
+      - --innodb-buffer-pool-size=128M
+      - --max-connections=50
+      - --innodb-log-buffer-size=16M
+    # 生产环境：不映射端口，MySQL 只在容器内网可达，绝不暴露公网
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${DB_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build: .
+    restart: unless-stopped
+    mem_limit: 384m
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: mysql+pymysql://root:${DB_PASSWORD}@db:3306/Person_Growth_Agent?charset=utf8mb4
+      # 云上走远程 LLM，不装 Ollama、不要 GPU
+      LLM_PROVIDER: openai
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.teamorouter.cn}
+      LLM_MODEL: ${LLM_MODEL:-glm-5.3-flash}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-90}
+      SECRET_KEY: ${SECRET_KEY}
+    # 阶段①临时开放便于用 IP 验证；阶段③ HTTPS 跑通后删除这两行，只留 Caddy 对外
+    ports:
+      - "8000:8000"
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  web:
+    build: .
+    restart: unless-stopped
+    mem_limit: 640m
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+    environment:
+      DATABASE_URL: mysql+pymysql://root:${DB_PASSWORD}@db:3306/Person_Growth_Agent?charset=utf8mb4
+      LLM_PROVIDER: openai
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.teamorouter.cn}
+      LLM_MODEL: ${LLM_MODEL:-glm-5.3-flash}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-90}
+    # 阶段①临时开放；阶段③ HTTPS 跑通后删除
+    ports:
+      - "8501:8501"
+    command: streamlit run app/agents/app.py --server.port=8501 --server.address=0.0.0.0 --server.headless=true
+
+  # 阶段③才启动（阶段①不要起它，域名没解析会拿不到证书）
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    mem_limit: 128m
+    depends_on:
+      - api
+      - web
+    environment:
+      DOMAIN: ${DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  mysql_data:
+  caddy_data:
+  caddy_config:

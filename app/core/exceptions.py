@@ -33,6 +33,16 @@ class UnauthorizedError(AppError):
         super().__init__(message)
 
 
+class ForbiddenError(AppError):
+    """权限不足（例如普通用户访问管理后台）"""
+
+    status_code = 403
+    error_code = "FORBIDDEN"
+
+    def __init__(self, message: str = "权限不足，无权访问此资源"):
+        super().__init__(message)
+
+
 # ========== 资源相关 ==========
 class NotFoundError(AppError):
     """资源不存在或无权访问（统一返回404，不泄露资源是否存在）"""

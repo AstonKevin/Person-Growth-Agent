@@ -6,6 +6,8 @@ class User(Base):
     id = Column(Integer,primary_key=True,nullable=False)
     name = Column(String(50),index=True,unique=True,nullable=False)
     password_hash = Column(String(100),nullable=False)
+    role = Column(String(20),default="user",nullable=False)       # user / admin
+    is_active = Column(Boolean,default=True,nullable=False)
     create_time = Column(DateTime,default=func.now() ,nullable=False)
     update_time = Column(DateTime,nullable=True)
     preference = Column(Text,nullable=True)

@@ -8,11 +8,15 @@ pydantic-settings==2.10.1
 anthropic==1.2.0
 httpx==0.28.1
 python-jose[cryptography]
+cryptography==50.0.1
 python-multipart
-langgraph
-langchain-core
+langgraph==1.2.11
+langchain-core==1.6.3
+langchain-ollama==1.1.0
+langchain-openai==1.6.2
 streamlit
 pandas
 plotly
 requests
 pytest
+PyYAML==6.0.3

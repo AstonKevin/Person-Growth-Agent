@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from ..database import SessionLocal
 from ..crud.plan import create_plan
 from ..schemas.plan import PlanCreate
-from .common import make_llm, parse_json
+from .common import make_llm, parse_json, tracked_chat
 
 
 WEEKLY_PROMPT = """你是一个专业的目标拆解专家。请根据用户的目标，生成一个按周拆解的详细计划。
@@ -127,7 +127,37 @@ def extract_structured_goal(raw_goal: str, text: str) -> StructuredGoal:
     return StructuredGoal(**data)
 
 
-llm = make_llm(temperature=0.3)
+# LLM 不再在模块级固定：由 graph config 按请求传入（支持每用户 BYOK）。
+from langchain_core.runnables import RunnableConfig
+
+
+def _llm(config: RunnableConfig):
+    """从 config 取本次调用该用的 LLM。"""
+    return config["configurable"]["llm"]
+
+
+def _user_id(config: RunnableConfig) -> int:
+    """从 config 取当前用户 id（替代过去写死的 USER_ID）。"""
+    return int(config["configurable"]["user_id"])
+
+
+def _model(config: RunnableConfig) -> str:
+    return config["configurable"].get("model", "unknown")
+
+
+def _provider(config: RunnableConfig) -> str | None:
+    return config["configurable"].get("provider")
+
+
+def _invoke_llm(messages, config: RunnableConfig):
+    """调 LLM 并记录用量（计时 / token / 错误，best-effort）。"""
+    return tracked_chat(
+        _llm(config),
+        messages,
+        user_id=_user_id(config),
+        model=_model(config),
+        provider=_provider(config),
+    )
 
 class GoalState(TypedDict):
     goal: str
@@ -147,10 +177,10 @@ class GoalState(TypedDict):
 
 MAX_PARSE_RETRIES = 2   # 解析失败时最多重试 2 次
 
-def parse_goal(state: GoalState):
+def parse_goal(state: GoalState, config: RunnableConfig):
     print("===[节点]parse_goal理解目标")
     for attempt in range(MAX_PARSE_RETRIES + 1):
-        resp = llm.invoke([HumanMessage(content=PARSE_GOAL_PROMPT.format(goal=state["goal"]))])
+        resp = _invoke_llm([HumanMessage(content=PARSE_GOAL_PROMPT.format(goal=state["goal"]))], config)
         try:
             sg = extract_structured_goal(state["goal"], resp.content)
             print(f"解析成功：{sg.title}/{sg.domain}/{sg.duration_weeks}")
@@ -214,7 +244,7 @@ def extract_daily_plans(text: str) -> list[DailyPlanItem]:
     return result
 
 
-def plan_weekly(state: GoalState):
+def plan_weekly(state: GoalState, config: RunnableConfig):
     print("\n=== [节点] plan_weekly 生成周计划 ===")
     sg = state.get("struct_goal")
     goal_text = state["goal"] if not sg else (
@@ -222,16 +252,16 @@ def plan_weekly(state: GoalState):
         f"持续{sg['duration_weeks']}周；成功标准：{'、'.join(sg['success_criteria'])}；"
         f"约束：{'、'.join(sg['constraints'])}"
     )
-    resp = llm.invoke([HumanMessage(content=WEEKLY_PROMPT.format(goal=goal_text))])
+    resp = _invoke_llm([HumanMessage(content=WEEKLY_PROMPT.format(goal=goal_text))], config)
     weekly = [w.model_dump() for w in extract_weekly_plans(resp.content)]
     return {"weekly_plans": weekly, "messages": [HumanMessage(content=f"已生成{len(weekly)}周计划")]}
 
-def plan_daily(state: GoalState):
+def plan_daily(state: GoalState, config: RunnableConfig):
     print("=== [节点] plan_daily 生成日计划 ===")
-    resp = llm.invoke([HumanMessage(content=DAILY_PROMPT.format(
-        goal=state["goal"], 
+    resp = _invoke_llm([HumanMessage(content=DAILY_PROMPT.format(
+        goal=state["goal"],
         weekly=json.dumps(state["weekly_plans"], ensure_ascii=False))
-    )])
+    )], config)
     daily = [d.model_dump() for d in extract_daily_plans(resp.content)]
     return {"daily_plans": daily}
 
@@ -269,9 +299,7 @@ def route(state: GoalState) -> str:
         return "output"
     return "plan_weekly"
 
-USER_ID = 1   # TODO: 临时写死，正式版应从登录态/JWT 传入；当前 user 表 id=1 为测试用户
-
-def save_plan(state: GoalState):
+def save_plan(state: GoalState, config: RunnableConfig):
     print("=== [节点] save_plan 存 MySQL ===")
 
     sg = state.get("struct_goal") or {}
@@ -292,7 +320,7 @@ def save_plan(state: GoalState):
     # 3. 开独立会话，用完即关
     db = SessionLocal()
     try:
-        plan = create_plan(db, plan_in, user_id=USER_ID)   # crud 里已 commit + refresh
+        plan = create_plan(db, plan_in, user_id=_user_id(config))   # crud 里已 commit + refresh
         print(f"  已写入 plan 表，id={plan.id}")
         return {"saved_plan_id": plan.id, "save_confirmed": True, "save_error": ""}
     except Exception as e:
@@ -330,12 +358,13 @@ graph = builder.compile()
 if __name__ == "__main__":
     import sys
     goal = sys.argv[1] if len(sys.argv) > 1 else "3个月内拿到暑期实习offer"
+    config = {"configurable": {"llm": make_llm(temperature=0.3), "user_id": 1}}
     result = graph.invoke({
         "goal": goal,
         "messages": [], "weekly_plans": [], "daily_plans": [],
         "is_valid": False, "validation_feedback": "",
         "retry_count": 0, "final_plan": {},
         "saved_plan_id": None, "save_confirmed": False, "save_error": "",
-    })
+    }, config)
     print(json.dumps(result["final_plan"], ensure_ascii=False, indent=2))
     print("存储确认:", result.get("save_confirmed"), "计划ID:", result.get("saved_plan_id"))

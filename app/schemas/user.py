@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class UserCreate(BaseModel):
@@ -12,8 +12,7 @@ class UserOut(BaseModel):
     id: int
     name: str
 
-    class Config:
-        from_attributes = True  # 允许从 SQLAlchemy ORM 对象直接读取
+    model_config = ConfigDict(from_attributes=True)
 
 
 class Token(BaseModel):

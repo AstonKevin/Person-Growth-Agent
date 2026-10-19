@@ -12,6 +12,10 @@ import app.models
 # access to the values within the .ini file in use.
 config = context.config
 
+# 容器内由环境变量 DATABASE_URL 注入，让迁移和应用用同一个数据库地址
+from app.core.config import get_settings
+config.set_main_option("sqlalchemy.url", get_settings().database_url)
+
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
 if config.config_file_name is not None:
@@ -80,3 +84,8 @@ if context.is_offline_mode():
     run_migrations_offline()
 else:
     run_migrations_online()
+
+# 让迁移用和应用一致的数据库配置（容器内由环境变量 DATABASE_URL 注入）
+from app.core.config import get_settings
+config.set_main_option("sqlalchemy.url", get_settings().database_url)
+

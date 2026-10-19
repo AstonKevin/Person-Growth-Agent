@@ -1,0 +1,58 @@
+services:
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: Person_Growth_Agent
+    volumes:
+      - mysql_data:/var/lib/mysql
+    ports:
+      - "3307:3306"   # 宿主机3306被本地MySQL占用，映射到3307；容器内部仍走3306
+    healthcheck:
+      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost", "-proot123" ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # 容器网络里 MySQL 主机名就是服务名 db，不再是 localhost
+      DATABASE_URL: mysql+pymysql://root:root123@db:3306/Person_Growth_Agent?charset=utf8mb4
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.teamorouter.cn}
+      LLM_MODEL: ${LLM_MODEL:-glm-5.3-flash}
+      SECRET_KEY: ${SECRET_KEY:-change-me}
+      LLM_PROVIDER: ollama
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma3:4b}
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  web:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+    environment:
+      DATABASE_URL: mysql+pymysql://root:root123@db:3306/Person_Growth_Agent?charset=utf8mb4
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_PROVIDER: ollama
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma3:4b}
+    ports:
+      - "8501:8501"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: streamlit run app/agents/app.py --server.port=8501 --server.address=0.0.0.0 --server.headless=true
+
+volumes:
+  mysql_data:

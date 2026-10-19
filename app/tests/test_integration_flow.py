@@ -10,6 +10,7 @@ import pytest
 from langgraph.types import Command
 from app.agents.goal_breakdown import graph as goal_graph
 from app.agents.tracking_agent import graph as tracking_graph
+from app.agents.common import make_llm
 from app.database import SessionLocal
 from app.models.plan import Plan
 from app.models.checkin import CheckIn
@@ -28,7 +29,8 @@ def _make_plan(goal_text):
     """跑目标拆解，返回新 plan id"""
     inp = dict(GOAL_INPUT)
     inp["goal"] = goal_text
-    r = goal_graph.invoke(inp)
+    cfg = {"configurable": {"llm": make_llm(), "user_id": 1}}
+    r = goal_graph.invoke(inp, cfg)
     assert r["save_confirmed"], "测试前置：目标拆解应成功"
     return r["saved_plan_id"]
 
