@@ -36,6 +36,7 @@ services:
       LLM_MODEL: ${LLM_MODEL:-glm-5.3-flash}
       LLM_TIMEOUT: ${LLM_TIMEOUT:-90}
       SECRET_KEY: ${SECRET_KEY}
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
     # 阶段①临时开放便于用 IP 验证；阶段③ HTTPS 跑通后删除这两行，只留 Caddy 对外
     ports:
       - "8000:8000"
@@ -57,6 +58,8 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.teamorouter.cn}
       LLM_MODEL: ${LLM_MODEL:-glm-5.3-flash}
       LLM_TIMEOUT: ${LLM_TIMEOUT:-90}
+      SECRET_KEY: ${SECRET_KEY}
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
     # 阶段①临时开放；阶段③ HTTPS 跑通后删除
     ports:
       - "8501:8501"
